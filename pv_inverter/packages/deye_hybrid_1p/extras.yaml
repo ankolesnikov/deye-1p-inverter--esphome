@@ -1,0 +1,358 @@
+substitutions:
+  fast_interval: "5000"
+  normal_interval: "10000"
+  standby_interval: "30000"
+  fast_pv_threshold: "500"
+  fast_battery_threshold: "500"
+  fast_load_threshold: "500"
+  fast_grid_threshold: "500"
+  normal_pv_threshold: "250"
+  normal_battery_threshold: "250"
+  normal_load_threshold: "250"
+
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+
+globals:
+  - id: is_system_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: is_standby_mode
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: current_update_interval
+    type: int
+    restore_value: no
+    initial_value: '10000'
+
+script:
+  - id: sync_inverter_time
+    then:
+      - lambda: |-
+          esphome::modbus_controller::ModbusController *controller = id(${modbus_controller_id});
+          time_t now = ::time(nullptr);
+          struct tm *time_info = ::localtime(&now);
+
+          if (time_info == nullptr) {
+            return;
+          }
+
+          int seconds = time_info->tm_sec;
+          int minutes = time_info->tm_min;
+          int hour = time_info->tm_hour;
+          int day = time_info->tm_mday;
+          int month = time_info->tm_mon + 1;
+          int year = time_info->tm_year + 1900;
+          int year1 = year - 2000;
+
+          if (year != 1970) {
+            uint16_t reg22_value = (year1 << 8) | month;
+            uint16_t reg23_value = (day << 8) | hour;
+            uint16_t reg24_value = (minutes << 8) | seconds;
+            std::vector<uint16_t> rtc_data = {reg22_value, reg23_value, reg24_value};
+            auto set_rtc_command =
+              esphome::modbus_controller::ModbusCommandItem::create_write_multiple_command(
+                controller, 22, rtc_data.size(), rtc_data
+              );
+            controller->queue_command(set_rtc_command);
+          }
+
+  - id: adjust_polling_rate
+    then:
+      - lambda: |-
+          esphome::modbus_controller::ModbusController *controller = id(${modbus_controller_id});
+
+          float pv = isnan(id(pv_power).state) ? 0.0 : id(pv_power).state;
+          float batt = isnan(id(battery_power).state) ? 0.0 : abs(id(battery_power).state);
+          float grid = isnan(id(grid_ct_abs_power).state) ? 0.0 : id(grid_ct_abs_power).state;
+          float load = isnan(id(estimated_total_load_power).state) ? 0.0 : id(estimated_total_load_power).state;
+
+          int new_interval = id(current_update_interval);
+
+          if (pv > atoi("${fast_pv_threshold}") ||
+              batt > atoi("${fast_battery_threshold}") ||
+              load > atoi("${fast_load_threshold}") ||
+              grid > atoi("${fast_grid_threshold}")) {
+            new_interval = atoi("${fast_interval}");
+            id(is_system_active) = true;
+            id(is_standby_mode) = false;
+          } else if (pv > atoi("${normal_pv_threshold}") ||
+                     batt > atoi("${normal_battery_threshold}") ||
+                     load > atoi("${normal_load_threshold}")) {
+            new_interval = atoi("${normal_interval}");
+            id(is_system_active) = false;
+            id(is_standby_mode) = false;
+          } else {
+            new_interval = atoi("${standby_interval}");
+            id(is_system_active) = false;
+            id(is_standby_mode) = true;
+          }
+
+          if (new_interval != id(current_update_interval)) {
+            id(current_update_interval) = new_interval;
+            controller->set_update_interval(new_interval);
+          }
+
+interval:
+  - interval: 3600s
+    then:
+      - script.execute: sync_inverter_time
+
+  - interval: 60s
+    then:
+      - script.execute: adjust_polling_rate
+
+button:
+  - platform: template
+    name: "Sync Inverter Time"
+    id: sync_time_button
+    icon: "mdi:clock-sync"
+    on_press:
+      - script.execute: sync_inverter_time
+
+binary_sensor:
+  - platform: template
+    name: "System Active"
+    id: system_active_sensor
+    icon: "mdi:lightning-bolt"
+    lambda: |-
+      return id(is_system_active);
+
+  - platform: template
+    name: "Standby Mode"
+    id: standby_mode_sensor
+    icon: "mdi:power-sleep"
+    lambda: |-
+      return id(is_standby_mode);
+
+  - platform: modbus_controller
+    modbus_controller_id: ${modbus_controller_id}
+    name: "Generator Peak Shaving Status"
+    id: generator_peak_shaving_status
+    register_type: holding
+    address: 280
+    bitmask: 0x10
+
+  - platform: modbus_controller
+    modbus_controller_id: ${modbus_controller_id}
+    name: "Grid Peak Shaving Status"
+    id: grid_peak_shaving_status
+    register_type: holding
+    address: 280
+    bitmask: 0x100
+
+sensor:
+  - platform: template
+    name: "Battery Charge Power"
+    id: battery_charge_power
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (isnan(id(battery_power).state)) return 0.0f;
+      if (id(battery_power).state > 0) return 0.0f;
+      return id(battery_power).state * -1.0f;
+
+  - platform: template
+    name: "Battery Discharge Power"
+    id: battery_discharge_power
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (isnan(id(battery_power).state)) return 0.0f;
+      if (id(battery_power).state < 0) return 0.0f;
+      return id(battery_power).state;
+
+  - platform: modbus_controller
+    modbus_controller_id: ${modbus_controller_id}
+    name: "Grid CT Power Raw"
+    id: grid_ct_power_raw
+    register_type: holding
+    address: 172
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    value_type: S_WORD
+    internal: true
+
+  - platform: template
+    name: "Grid Import Power"
+    id: grid_import_power_split
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (isnan(id(grid_ct_power_raw).state)) return 0.0f;
+      if (id(grid_ct_power_raw).state < 0) return 0.0f;
+      return id(grid_ct_power_raw).state;
+
+  - platform: template
+    name: "Grid Export Power"
+    id: grid_export_power_split
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (isnan(id(grid_ct_power_raw).state)) return 0.0f;
+      if (id(grid_ct_power_raw).state > 0) return 0.0f;
+      return id(grid_ct_power_raw).state * -1.0f;
+
+  - platform: template
+    name: "Grid CT Absolute Power"
+    id: grid_ct_abs_power
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (isnan(id(grid_ct_power_raw).state)) return 0.0f;
+      return abs(id(grid_ct_power_raw).state);
+
+  - platform: modbus_controller
+    modbus_controller_id: ${modbus_controller_id}
+    name: "Load Power Raw"
+    id: load_power_raw
+    register_type: holding
+    address: 178
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    value_type: S_WORD
+    internal: true
+
+  - platform: template
+    name: "Estimated Total Load Power"
+    id: estimated_total_load_power
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (isnan(id(load_power_raw).state)) return 0.0f;
+      return id(load_power_raw).state;
+
+  - platform: template
+    name: "Generator / AUX Power Alias"
+    id: generator_aux_power_alias
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (isnan(id(generator_power_total).state)) return 0.0f;
+      return id(generator_power_total).state;
+
+  - platform: template
+    name: "PV Self Consumption Estimate"
+    id: pv_self_consumption_estimate
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      float pv = isnan(id(pv_power).state) ? 0.0f : id(pv_power).state;
+      float export_p = isnan(id(grid_export_power_split).state) ? 0.0f : id(grid_export_power_split).state;
+      float batt_charge = isnan(id(battery_charge_power).state) ? 0.0f : id(battery_charge_power).state;
+      float v = pv - export_p - batt_charge;
+      if (v < 0) return 0.0f;
+      return v;
+
+  - platform: modbus_controller
+    modbus_controller_id: ${modbus_controller_id}
+    id: reg_16_raw
+    register_type: holding
+    address: 16
+    value_type: U_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: ${modbus_controller_id}
+    id: reg_17_raw
+    register_type: holding
+    address: 17
+    value_type: U_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: ${modbus_controller_id}
+    id: reg_274_raw
+    register_type: holding
+    address: 274
+    value_type: U_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: ${modbus_controller_id}
+    id: reg_275_raw
+    register_type: holding
+    address: 275
+    value_type: U_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: ${modbus_controller_id}
+    id: reg_276_raw
+    register_type: holding
+    address: 276
+    value_type: U_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: ${modbus_controller_id}
+    id: reg_277_raw
+    register_type: holding
+    address: 277
+    value_type: U_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: ${modbus_controller_id}
+    id: reg_278_raw
+    register_type: holding
+    address: 278
+    value_type: U_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: ${modbus_controller_id}
+    id: reg_279_raw
+    register_type: holding
+    address: 279
+    value_type: U_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: ${modbus_controller_id}
+    id: reg_280_raw
+    register_type: holding
+    address: 280
+    value_type: U_WORD
+    internal: true
+
+  - platform: modbus_controller
+    modbus_controller_id: ${modbus_controller_id}
+    id: reg_326_raw
+    register_type: holding
+    address: 326
+    value_type: U_WORD
+    internal: true
